@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Run outputs (per_sample.jsonl / results.json artifacts)
+outputs/
+outputs_*/
