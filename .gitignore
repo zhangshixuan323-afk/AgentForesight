@@ -5,6 +5,18 @@ __pycache__/
 .venv/
 venv/
 
-# Run outputs (per_sample.jsonl / results.json artifacts)
-outputs/
+# Run outputs: ignore derived caches, but TRACK the final report artifacts so
+# they can be inspected locally (calib / profile / substitute-run results).
+# Layer by layer: ignore everything under outputs/, then whitelist only the
+# final artifacts; intermediate/large files (per-shard jsonl, smoke, older
+# profiles) stay ignored.
+outputs/*
+!outputs/calib.json
+!outputs/profile_tok.json
+!outputs/qwen/
+outputs/qwen/*
+!outputs/qwen/extrapolate.json
+!outputs/qwen/final/
+outputs/qwen/final/*
+!outputs/qwen/final/results.json
 outputs_*/
