@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # 3x A800 shard runner for the AgentForesight online audit.
 #
+# Layout: repo at ~/shixuan/AgentForesight (git tracks only this subtree);
+# model weights under ~/shixuan/models/ (outside git).
 # One process per GPU (CUDA_VISIBLE_DEVICES=i), each auditing a round-robin
 # 1/N_GPUS slice of the 83-sample test set, then merging into outputs/final.
 # Resumable: re-running continues from the per-sample.jsonl checkpoints.
 #
 # Usage:
-#   MODEL_PATH=/path/to/AgentForesight-7B DATA_DIR=... OUT=... ./run_remote.sh [local|oracle|mock]
-#   (backend defaults to "local"; MOCK_MODE=safe|last|random for mock)
+#   ./run_remote.sh [local|oracle|mock]        # backend defaults to "local"
+#   MODEL_PATH=... DATA_DIR=... OUT=... ./run_remote.sh
+#   MOCK_MODE=safe|last|random ./run_remote.sh mock
 set -euo pipefail
 
 BACKEND="${1:-local}"
-MODEL_PATH="${MODEL_PATH:-}"
-DATA_DIR="${DATA_DIR:-$HOME/AgentForesight/sample100_by_benchmark}"
-OUT="${OUT:-$HOME/AgentForesight/outputs}"
+MODEL_PATH="${MODEL_PATH:-$HOME/shixuan/models/AgentForesight-7B}"
+DATA_DIR="${DATA_DIR:-$HOME/shixuan/AgentForesight/sample100_by_benchmark}"
+OUT="${OUT:-$HOME/shixuan/AgentForesight/outputs}"
 N_GPUS="${N_GPUS:-3}"
 MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-30720}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
