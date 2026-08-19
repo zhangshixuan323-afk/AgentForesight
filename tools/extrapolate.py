@@ -74,6 +74,34 @@ def _pct(pred: float, meas: float) -> float | None:
     return (pred - meas) / meas * 100 if meas else None
 
 
+def _ols3(x1: list[float], x2: list[float], y: list[float]) -> tuple[float, float, float]:
+    """Least-squares fit y = a*x1 + b*x2 + c via normal equations (3x3).
+
+    Used to derive *run-condition* engine constants from a measured run:
+    gen_s ~ prompt_tokens/prefill_tps + completion_tokens/decode_tps + overhead.
+    """
+    n = len(x1)
+    A = [[sum(v * v for v in x1), sum(a * b for a, b in zip(x1, x2)), sum(x1)],
+         [sum(a * b for a, b in zip(x1, x2)), sum(v * v for v in x2), sum(x2)],
+         [sum(x1), sum(x2), float(n)]]
+    bv = [sum(a * b for a, b in zip(x1, y)),
+          sum(a * b for a, b in zip(x2, y)),
+          sum(y)]
+    for col in range(3):
+        piv = max(range(col, 3), key=lambda r: abs(A[r][col]))
+        A[col], A[piv] = A[piv], A[col]
+        bv[col], bv[piv] = bv[piv], bv[col]
+        for r in range(col + 1, 3):
+            f = A[r][col] / A[col][col]
+            for c2 in range(col, 3):
+                A[r][c2] -= f * A[col][c2]
+            bv[r] -= f * bv[col]
+    x = [0.0, 0.0, 0.0]
+    for r in range(2, -1, -1):
+        x[r] = (bv[r] - sum(A[r][c2] * x[c2] for c2 in range(r + 1, 3))) / A[r][r]
+    return (x[0], x[1], x[2])
+
+
 def _estimate_calls(inputs: list[float], out_per_call: float,
                     prefill_fn, decode_fn) -> dict:
     """Time of a call sequence with per-call input token counts."""
@@ -123,39 +151,9 @@ def main() -> None:
               f"calls={calls:,.0f}, tokens={est['input_tokens'] + est['output_tokens']:,.0f}, "
               f"time ~{est['total_s'] / 3600:.2f} h (1x A800)")
 
-    prof_path = Path(args.profile)
-    if prof_path.exists():
-        prof = json.loads(prof_path.read_text(encoding="utf-8"))
-        out_per_call = prof.get("config", {}).get("out_tokens_per_call", args.out_tokens_per_call)
-        for sc in prof["totals"]:
-            t = prof["totals"][sc]
-            col = "naive"
-            tot_tok = t["total_tokens_" + col]["total"]
-            # length-aware per-sample estimate when prefix curves exist
-            samples = prof.get("per_sample", [])
-            with_curves = [s for s in samples if s.get("prefix_tokens")]
-            if with_curves and sc in ("perfect", "worst", "measured"):
-                total_s = 0.0
-                for s in samples:
-                    curve = s.get("prefix_tokens") or []
-                    if not curve:
-                        continue
-                    d = {"perfect": s["gt_step"], "worst": s["n_steps"] - 1}.get(sc, s.get("detection_measured", -1))
-                    if sc == "measured" and (d is None or d < 0):
-                        d = s["n_steps"] - 1
-                    inputs = curve[:d + 1]
-                    total_s += _estimate_calls(inputs, out_per_call, prefill_fn, decode_fn)["total_s"]
-            else:
-                total_s = (t["input_tokens_" + col]["total"] / calib["prefill_tps"]
-                           + t["output_tokens"]["total"] / calib["decode_tps"])
-            print(f"\n[{sc} / {col}] calls={t['calls']['total']:,.0f} "
-                  f"tokens={tot_tok:,.0f} -> time ~{total_s / 3600:.2f} h (1x A800, length-aware)")
-            result[f"{sc}_naive"] = {"calls": t["calls"]["total"], "total_tokens": tot_tok,
-                                     "total_s": total_s, "hours_1gpu": total_s / 3600}
-            t_c = t["total_tokens_compressed_ub"]["total"]
-            result[f"{sc}_compression_saving"] = {"naive": tot_tok, "compressed_ub": t_c,
-                                                  "saving_pct": (1 - t_c / tot_tok) * 100 if tot_tok else None}
-
+    # --- measured run: run-condition engine fit + bias correction -------------
+    c_scale = None          # correction factor for length-aware scenario estimates
+    fitted = None
     if args.measured:
         meas_path = Path(args.measured)
         raw = meas_path.read_text(encoding="utf-8")
@@ -184,21 +182,76 @@ def main() -> None:
             "n": len(dedup),
         }
         m["total_tokens"] = m["prompt_tokens"] + m["completion_tokens"]
-        # length-aware prediction per measured sample (avg input length per call)
+        # 1) length-aware prediction using the microbenchmark curves
         pred_s = 0.0
         for r in dedup:
             n = max(1, r.get("num_calls", 1))
             avg_in = max(1.0, r.get("prompt_tokens", 0) / n)
             avg_out = max(0.0, r.get("completion_tokens", 0) / n)
             pred_s += avg_in * n / prefill_fn(avg_in) + avg_out * n / decode_fn(avg_in)
+        # 2) run-condition engine constants: gen_s = pt/P_eff + ct/D_eff + overhead
+        pt_l = [float(r.get("prompt_tokens", 0)) for r in dedup]
+        ct_l = [float(r.get("completion_tokens", 0)) for r in dedup]
+        g_l = [float(r.get("gen_time_s", 0) or 0) for r in dedup]
+        a, b, c = _ols3(pt_l, ct_l, g_l)
+        p_eff = 1.0 / a if a > 1e-12 else None
+        d_eff = 1.0 / b if b > 1e-12 else None
+        pred_fit = [a * pt + b * ct + c for pt, ct in zip(pt_l, ct_l)]
+        fitted = {"prefill_tps_eff": p_eff, "decode_tps_eff": d_eff,
+                  "overhead_s_per_sample": c}
         rg = _pct(pred_s, m["gen_s"])
+        rf = _pct(sum(pred_fit), m["gen_s"])
         rw = _pct(pred_s, m["wall_s"])
+        c_scale = m["gen_s"] / pred_s if pred_s > 0 else None
         print(f"\nmeasured run ({meas_path}): n={m['n']} calls={m['calls']:,.0f} "
               f"gen={m['gen_s']:.1f}s wall={m['wall_s']:.1f}s tokens={m['total_tokens']:,.0f}")
-        print(f"  predicted (length-aware)={pred_s:.1f}s -> residual gen "
-              f"{f'{rg:.1f}%' if rg is not None else 'n/a'}, wall {f'{rw:.1f}%' if rw is not None else 'n/a'}")
-        result["measured"] = {"measured": m, "predicted_s": pred_s,
-                              "residual_gen_pct": rg, "residual_wall_pct": rw}
+        print(f"  predicted (microbench, length-aware)={pred_s:.1f}s -> residual gen "
+              f"{f'{rg:.1f}%' if rg is not None else 'n/a'}")
+        print(f"  run-condition fit: prefill_eff={p_eff:,.0f} decode_eff={d_eff:,.1f} tok/s "
+              f"(overhead {c:.2f}s/sample) -> residual {f'{rf:.1f}%' if rf is not None else 'n/a'}")
+        result["measured"] = {"measured": m, "predicted_microbench_s": pred_s,
+                              "residual_gen_pct": rg, "residual_wall_pct": rw,
+                              "run_condition_fit": fitted,
+                              "residual_fit_pct": rf,
+                              "correction_scale": c_scale}
+
+    # --- workload scenarios (length-aware, raw + bias-corrected) --------------
+    prof_path = Path(args.profile)
+    if prof_path.exists():
+        prof = json.loads(prof_path.read_text(encoding="utf-8"))
+        out_per_call = prof.get("config", {}).get("out_tokens_per_call", args.out_tokens_per_call)
+        for sc in prof["totals"]:
+            t = prof["totals"][sc]
+            col = "naive"
+            tot_tok = t["total_tokens_" + col]["total"]
+            samples = prof.get("per_sample", [])
+            with_curves = [s for s in samples if s.get("prefix_tokens")]
+            if with_curves and sc in ("perfect", "worst", "measured"):
+                total_s = 0.0
+                for s in samples:
+                    curve = s.get("prefix_tokens") or []
+                    if not curve:
+                        continue
+                    d = {"perfect": s["gt_step"], "worst": s["n_steps"] - 1}.get(sc, s.get("detection_measured", -1))
+                    if sc == "measured" and (d is None or d < 0):
+                        d = s["n_steps"] - 1
+                    inputs = curve[:d + 1]
+                    total_s += _estimate_calls(inputs, out_per_call, prefill_fn, decode_fn)["total_s"]
+            else:
+                total_s = (t["input_tokens_" + col]["total"] / calib["prefill_tps"]
+                           + t["output_tokens"]["total"] / calib["decode_tps"])
+            corr_s = total_s * c_scale if c_scale is not None else None
+            line = f"[{sc} / {col}] calls={t['calls']['total']:,.0f} tokens={tot_tok:,.0f} -> " \
+                   f"~{total_s / 3600:.2f} h (1x A800, microbench)"
+            if corr_s is not None:
+                line += f" | bias-corrected ~{corr_s / 3600:.2f} h (x{c_scale:.3f})"
+            print(line)
+            result[f"{sc}_naive"] = {"calls": t["calls"]["total"], "total_tokens": tot_tok,
+                                     "total_s": total_s, "hours_1gpu": total_s / 3600,
+                                     "hours_1gpu_corrected": corr_s / 3600 if corr_s is not None else None}
+            t_c = t["total_tokens_compressed_ub"]["total"]
+            result[f"{sc}_compression_saving"] = {"naive": tot_tok, "compressed_ub": t_c,
+                                                  "saving_pct": (1 - t_c / tot_tok) * 100 if tot_tok else None}
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
