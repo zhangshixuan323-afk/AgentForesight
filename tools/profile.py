@@ -126,6 +126,7 @@ def main() -> None:
             "conv_id": r.conv_id, "domain": r.domain,
             "n_steps": n, "gt_step": r.mistake_step,
             "detection_measured": d_measured,
+            "prefix_tokens": [int(round(v)) for v in prefix],
             "scenarios": rows,
         })
 

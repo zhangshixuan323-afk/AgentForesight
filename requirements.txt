@@ -3,6 +3,8 @@ pyarrow>=14.0
 numpy>=1.24
 tqdm>=4.65
 # Local-model inference (inference/infer_local.py)
+# GPU: install the CUDA build of torch, e.g.
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cu126
 torch>=2.4
 transformers>=4.45
 accelerate>=0.30        # required by device_map="auto"
