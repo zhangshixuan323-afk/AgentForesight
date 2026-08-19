@@ -92,6 +92,9 @@ def main() -> None:
                    help="Compression V1: per-turn content cap for verbatim turns.")
     p.add_argument("--summary-chars", type=int, default=600,
                    help="Compression V1: L1 summary length per compressed turn.")
+    p.add_argument("--l2-summary", action="store_true",
+                   help="Use the L2 rolling model summary (compression V2) instead of "
+                        "the L1 middle-collapse fallback for over-budget prefixes.")
     p.add_argument("--no-resume", action="store_true",
                    help="Restart from scratch instead of skipping already-audited conv_ids.")
     p.add_argument("--snapshot-every", type=int, default=25,
@@ -117,11 +120,21 @@ def main() -> None:
         auditor = MockAuditor(args.mock_mode)
     else:
         model, tokenizer = load_model(args.model_path, args.device)
-        auditor = LocalAuditor(model, tokenizer,
-                               max_input_tokens=args.max_input_tokens,
-                               keep_recent=args.keep_recent,
-                               per_turn_chars=args.per_turn_chars,
-                               summary_chars=args.summary_chars)
+        if args.l2_summary:
+            from inference.audit import SummarizingLocalAuditor
+            auditor = SummarizingLocalAuditor(
+                model, tokenizer,
+                max_input_tokens=args.max_input_tokens,
+                keep_recent=args.keep_recent,
+                per_turn_chars=args.per_turn_chars,
+                summary_chars=args.summary_chars,
+            )
+        else:
+            auditor = LocalAuditor(model, tokenizer,
+                                   max_input_tokens=args.max_input_tokens,
+                                   keep_recent=args.keep_recent,
+                                   per_turn_chars=args.per_turn_chars,
+                                   summary_chars=args.summary_chars)
 
     run_audit(
         records, auditor, args.output_dir,
@@ -139,6 +152,7 @@ def main() -> None:
             "keep_recent": args.keep_recent,
             "per_turn_chars": args.per_turn_chars,
             "summary_chars": args.summary_chars,
+            "l2_summary": args.l2_summary,
             "shard_index": args.shard_index,
             "shard_count": args.shard_count,
         },

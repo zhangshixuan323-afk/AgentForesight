@@ -36,20 +36,27 @@ from inference.metrics import (
     format_report,
     per_sample_metrics,
 )
-from inference.prompts import AuditVerdict, build_messages, parse_response
+from inference.prompts import (
+    AuditVerdict,
+    build_messages,
+    build_summary_messages,
+    parse_response,
+)
 
 
 # --- call statistics ---------------------------------------------------------
 
 class CallStats:
-    __slots__ = ("gen_s", "prompt_tokens", "completion_tokens", "compress")
+    __slots__ = ("gen_s", "prompt_tokens", "completion_tokens", "compress", "compress_gen_s")
 
     def __init__(self, gen_s: float = 0.0, prompt_tokens: int = 0,
-                 completion_tokens: int = 0, compress: dict | None = None):
+                 completion_tokens: int = 0, compress: dict | None = None,
+                 compress_gen_s: float = 0.0):
         self.gen_s = gen_s
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.compress = compress
+        self.compress_gen_s = compress_gen_s
 
 
 # --- backends ----------------------------------------------------------------
@@ -187,6 +194,94 @@ class ApiAuditor:
         return parse_response(raw, max_step=k), CallStats(gen_s, int(pt), int(ct), cstats)
 
 
+class SummarizingLocalAuditor(LocalAuditor):
+    """L2 rolling model summary on top of the L1 windowed compression.
+
+    When the L1 window is still over budget (allow_collapse=False reports
+    over_budget), the already-reviewed span [0..m] is compressed into a
+    model-generated summary (built incrementally in ``summary_interval``-turn
+    chunks), and the auditor prompt becomes:
+
+        [Prior summary of steps 0..m] + verbatim turns (m+1..k)
+
+    The summary is cached per sample and only re-generated when the covered
+    span advances (rolling update), so repeated prefix calls reuse it. Summary
+    generation time/count is tracked separately (compress_gen_s).
+    """
+
+    name = "local-l2"
+
+    def __init__(self, model, tokenizer, *, max_input_tokens: int = 30720,
+                 keep_recent: int = 24, per_turn_chars: int = 12000,
+                 summary_chars: int = 600, summary_budget_chars: int = 2000,
+                 summary_interval: int = 16):
+        super().__init__(model, tokenizer, max_input_tokens=max_input_tokens,
+                         keep_recent=keep_recent, per_turn_chars=per_turn_chars,
+                         summary_chars=summary_chars)
+        self.summary_budget_chars = summary_budget_chars
+        self.summary_interval = summary_interval
+        self._summaries: dict[str, tuple[int, str]] = {}     # conv_id -> (covered_until, text)
+
+    def judge(self, rec: TrajectoryRecord, k: int | None,
+              max_new_tokens: int = 2048, temperature: float = 0.0,
+              ) -> tuple[AuditVerdict, CallStats]:
+        if k is None:
+            return super().judge(rec, k, max_new_tokens, temperature)
+
+        msgs, stats = build_messages(
+            rec.turns, tools=rec.tools, current_step=k,
+            tokenizer=self.tokenizer, max_input_tokens=self.max_input_tokens,
+            keep_recent=self.keep_recent, per_turn_chars=self.per_turn_chars,
+            summary_chars=self.summary_chars, return_stats=True,
+            allow_collapse=False,
+        )
+        if not stats.get("over_budget"):
+            raw, st = self._generate(msgs, max_new_tokens, temperature)
+            st.compress = stats
+            return parse_response(raw, max_step=k), st
+
+        # L2: rolling model summary of [0..m] + verbatim tail (m+1..k).
+        m = max(0, k - self.keep_recent)
+        text, covered = self._summaries.get(rec.conv_id, (None, ""))
+        compress_gen_s = 0.0
+        if covered is None or covered < m:
+            text, covered, compress_gen_s = self._ensure_summary(rec, m, max_new_tokens, temperature)
+            self._summaries[rec.conv_id] = (covered, text)
+        tail_start = min(m + 1, len(rec.turns))
+        msgs2, stats2 = build_messages(
+            rec.turns, tools=rec.tools, current_step=k,
+            tokenizer=self.tokenizer, max_input_tokens=self.max_input_tokens,
+            keep_recent=self.keep_recent, per_turn_chars=self.per_turn_chars,
+            summary_chars=self.summary_chars, return_stats=True,
+            allow_collapse=False, prior_summary=text, tail_start=tail_start,
+        )
+        raw, st = self._generate(msgs2, max_new_tokens, temperature)
+        st.compress = {**stats2, "l2_summary": True, "summary_covered_until": covered}
+        st.compress_gen_s = compress_gen_s
+        return parse_response(raw, max_step=k), st
+
+    def _ensure_summary(self, rec: TrajectoryRecord, m: int, max_new_tokens: int,
+                        temperature: float) -> tuple[str, int, float]:
+        """Roll the cached summary forward to cover step m (chunked)."""
+        text, covered = self._summaries.get(rec.conv_id, (None, ""))
+        total_gen = 0.0
+        while covered is None or covered < m:
+            start = 0 if covered is None else covered + 1
+            target = min(m, start + self.summary_interval - 1)
+            msgs = build_summary_messages(
+                rec.turns, start, target,
+                prior_summary=text,
+                budget_chars=self.summary_budget_chars,
+                per_turn_chars=self.per_turn_chars,
+            )
+            raw, s = self._generate(msgs, max_new_tokens, temperature)
+            total_gen += s.gen_s
+            text = raw.strip()
+            covered = target
+            self._summaries[rec.conv_id] = (covered, text)
+        return text, covered, total_gen
+
+
 # --- engine ------------------------------------------------------------------
 
 def audit_one(rec: TrajectoryRecord, auditor, max_new_tokens: int,
@@ -195,27 +290,33 @@ def audit_one(rec: TrajectoryRecord, auditor, max_new_tokens: int,
     total_gen = 0.0
     n_calls = 0
     pt = ct = n_compressed = 0
+    compress_s = 0.0
+    n_summary = 0
+
+    def _absorb(st: CallStats) -> None:
+        nonlocal total_gen, pt, ct, n_compressed, compress_s, n_summary
+        total_gen += st.gen_s
+        pt += st.prompt_tokens
+        ct += st.completion_tokens
+        compress_s += st.compress_gen_s
+        if st.compress:
+            if st.compress.get("verbatim") is False:
+                n_compressed += 1
+            if st.compress.get("l2_summary"):
+                n_summary += 1
 
     if rec.label == "safe":
         verdict, st = auditor.judge(rec, None, max_new_tokens, temperature)
-        total_gen += st.gen_s
+        _absorb(st)
         n_calls = 1
-        pt += st.prompt_tokens
-        ct += st.completion_tokens
-        if st.compress and st.compress.get("verbatim") is False:
-            n_compressed += 1
         detection_step = -1
     else:
         last: AuditVerdict | None = None
         detection_step = -1
         for k in range(rec.num_turns):
             verdict, st = auditor.judge(rec, k, max_new_tokens, temperature)
-            total_gen += st.gen_s
+            _absorb(st)
             n_calls += 1
-            pt += st.prompt_tokens
-            ct += st.completion_tokens
-            if st.compress and st.compress.get("verbatim") is False:
-                n_compressed += 1
             last = verdict
             if verdict.valid and verdict.pred_step >= 0:
                 detection_step = k          # d(tau): earliest ALARM prefix
@@ -244,6 +345,8 @@ def audit_one(rec: TrajectoryRecord, auditor, max_new_tokens: int,
         "completion_tokens": ct,
         "total_tokens": pt + ct,
         "n_compressed_calls": n_compressed,
+        "compress_time_s": round(compress_s, 4),
+        "n_summary_calls": n_summary,
         "raw_response": verdict.raw_response[:3000],
         **per_sample_metrics(verdict.pred_step, rec.mistake_step),
         **agent_row_fields(verdict.pred_agent, rec.mistake_agent),
