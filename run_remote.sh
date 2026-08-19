@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 3x A800 shard runner for the AgentForesight online audit.
 #
-# Layout: repo at ~/shixuan/AgentForesight (git tracks only this subtree);
-# model weights under ~/shixuan/models/ (outside git).
+# Layout: repo at ~/AgentForesight (i.e. /home/shixuan/AgentForesight; git
+# tracks only this subtree); model weights under ~/models/ (outside git).
 # One process per GPU (CUDA_VISIBLE_DEVICES=i), each auditing a round-robin
 # 1/N_GPUS slice of the 83-sample test set, then merging into outputs/final.
 # Resumable: re-running continues from the per-sample.jsonl checkpoints.
@@ -14,9 +14,9 @@
 set -euo pipefail
 
 BACKEND="${1:-local}"
-MODEL_PATH="${MODEL_PATH:-$HOME/shixuan/models/AgentForesight-7B}"
-DATA_DIR="${DATA_DIR:-$HOME/shixuan/AgentForesight/sample100_by_benchmark}"
-OUT="${OUT:-$HOME/shixuan/AgentForesight/outputs}"
+MODEL_PATH="${MODEL_PATH:-$HOME/models/AgentForesight-7B}"
+DATA_DIR="${DATA_DIR:-$HOME/AgentForesight/sample100_by_benchmark}"
+OUT="${OUT:-$HOME/AgentForesight/outputs}"
 N_GPUS="${N_GPUS:-3}"
 MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-30720}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
